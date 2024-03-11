@@ -36,7 +36,7 @@ algorithms = {
 
 title_font = QtGui.QFont('OpenSans', 18)
 text_font = QtGui.QFont('OpenSans', 14)
-settings = QtCore.QSettings()
+settings = QtCore.QSettings('DropDup', 'settings')
 
 
 def remove_groups(groups):

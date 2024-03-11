@@ -1,3 +1,5 @@
 /.DS_Store
 /DropDup.exe
 /DropDup.exe.zip
+venv
+__pycache__
