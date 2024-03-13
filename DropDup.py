@@ -23,10 +23,12 @@ from PIL import Image
 import subprocess
 import shutil
 import peewee
+import math
 import sys
 import os
 
 database = peewee.SqliteDatabase(os.path.join(application_path(), 'processing.sqlite3'))
+
 algorithms = {
     'rhash': rhash,
     'phash': phash,
@@ -39,44 +41,45 @@ text_font = QtGui.QFont('OpenSans', 14)
 settings = QtCore.QSettings('DropDup', 'settings')
 
 
-def remove_groups(groups):
-    processed_images = {}
-    for group in groups:
-        sorted_group = sorted(group, key=lambda processed_image: processed_image['image_width'] * processed_image['image_height'] * processed_image['image_dpi'])
-        processed_images = processed_images.union([processed_image['image_path']] for processed_image in sorted_group)
-        for other_processed_image in sorted_group:
-            os.remove(other_processed_image['image_path'])
+def get_dublicates(group):
+    images = ProcessedImage.select().where(ProcessedImage.id.in_(group))
+    original_image = max(images, key=lambda img: (img.image_width * img.image_height, img.image_dpi))
 
-    return processed_images
+    return [image.image_path for image in images if image.id != original_image.id]
+
+
+def remove_groups(groups):
+    for group in groups:
+        dublicates = get_dublicates(group)
+        for image_path in dublicates:
+            os.remove(image_path)
 
 
 def move_groups(groups, path_to_duplicates):
-    processed_images = {}
     for group in groups:
-        sorted_group = sorted(group, key=lambda processed_image: processed_image['image_width'] * processed_image['image_height'] * processed_image['image_dpi'])
-        processed_images = processed_images.union([processed_image['image_path']] for processed_image in sorted_group)
-        for other_processed_image in sorted_group:
-            image_path = other_processed_image['image_path']
+        dublicates = get_dublicates(group)
+        for image_path in dublicates:
             shutil.move(image_path, os.path.join(path_to_duplicates, os.path.split(image_path)[1]))
 
-    return processed_images
+
+def remove_files(ids):
+    images = ProcessedImage.select().where(ProcessedImage.id.in_(ids))
+    for image in images:
+        os.remove(image.image_path)
 
 
-def remove_files(files):
-    for filepath in files:
-        os.remove(filepath)
-
-
-def move_files(files, path_to_duplicates):
-    for filepath in files:
-        shutil.move(filepath, os.path.join(path_to_duplicates, os.path.split(filepath)[1]))
+def move_files(ids, path_to_duplicates):
+    images = ProcessedImage.select().where(ProcessedImage.id.in_(ids))
+    for image in images:
+        image_path = image.image_path
+        shutil.move(image_path, os.path.join(path_to_duplicates, os.path.split(image_path)[1]))
 
 
 def update_groups(groups, processed_images):
     new_groups = []
 
     for group in groups:
-        new_groups.append([processed_image for processed_image in group if processed_image['image_path'] not in processed_images])
+        new_groups.append([image_id for image_id in group if image_id not in processed_images])
 
     return new_groups
 
@@ -93,6 +96,38 @@ def open_file_explorer(path):
         subprocess.run(['open', '-R', path])
     elif sys.platform.startswith('linux'):
         subprocess.run(['xdg-open', directory])
+
+
+def _is_image(filename):
+    _, ext = os.path.splitext(filename)
+    if ext.lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.svg'):
+        return True
+    return False
+
+
+def count_files(path, check_subdirectories=False):
+    if check_subdirectories:
+        return sum(1 for root, dirs, files in os.walk(path) for name in files if _is_image(os.path.join(root, name)))
+    else:
+        return sum(1 for name in os.listdir(path) if _is_image(os.path.join(path, name)))
+
+
+def file_generator(path, check_subdirectories=False):
+    if check_subdirectories:
+        for root, dirs, files in os.walk(path):
+            for name in files:
+                if _is_image(os.path.join(root, name)):
+                    yield os.path.join(root, name)
+    else:
+        for name in os.listdir(path):
+            if _is_image(os.path.join(path, name)):
+                yield os.path.join(path, name)
+
+
+def ID_generator(processed_images: int):
+    for id1 in range(processed_images):
+        for id2 in range(id1 + 1, processed_images):
+            yield (id1 + 1, id2 + 1)
 
 
 def _create_hash(filepath, algorithm, algorithm_str, hash_size, use_crop_resistant_hash):
@@ -118,7 +153,7 @@ def _create_hash(filepath, algorithm, algorithm_str, hash_size, use_crop_resista
         image_dpi = int(max(image.info['dpi']))
     image_size = os.path.getsize(filepath) / 1048576
 
-    return {
+    processed_image_data = {
         'image_hash': str(image_hash),
         'image_path': filepath,
         'image_width': image_width,
@@ -126,6 +161,24 @@ def _create_hash(filepath, algorithm, algorithm_str, hash_size, use_crop_resista
         'image_dpi': image_dpi,
         'image_size': image_size,
     }
+
+    processed_image = ProcessedImage.create(**processed_image_data)
+    processed_image.save()
+
+
+def _get_hash(hex_hash):
+    return hex_to_hash(hex_hash) if ',' not in hex_hash else hex_to_multihash(hex_hash)
+
+
+def _compare_images(id1, id2, threshold):
+    img1_hash = ProcessedImage.select().where(ProcessedImage.id == id1).dicts().get()['image_hash']
+    img2_hash = ProcessedImage.select().where(ProcessedImage.id == id2).dicts().get()['image_hash']
+
+    difference = _get_hash(img1_hash) - _get_hash(img2_hash)
+
+    if (1 - difference) >= round(threshold / 100, 2):
+        return [id1, id2]
+    return None
 
 
 class ProcessedImage(peewee.Model):
@@ -165,6 +218,14 @@ class FindDuplicatesThread(QtCore.QThread):
         self.duplicates = []
         self.full_duplicates = []
 
+        self.executor = None
+        self.results = []
+        self.allow_work = True
+
+    def create_executor(self):
+        self.executor = ProcessPoolExecutor(max_workers=settings.value('max_cores', os.cpu_count() or 1, int))
+        self.results = []
+
     def run(self):
         self.process_signal.emit(self._progress)
 
@@ -189,62 +250,49 @@ class FindDuplicatesThread(QtCore.QThread):
         differences = []
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
-                differences.append(self.__get_hash(group[i]['image_hash']) - self.__get_hash(group[j]['image_hash']))
+                img1_hash = ProcessedImage.select().where(ProcessedImage.id == group[i]).dicts().get()['image_hash']
+                img2_hash = ProcessedImage.select().where(ProcessedImage.id == group[j]).dicts().get()['image_hash']
+
+                differences.append(_get_hash(img1_hash) - _get_hash(img2_hash))
 
         return sum(differences) / len(differences)
 
-    def __is_image(self, filename):
-        _, ext = os.path.splitext(filename)
-        if ext.lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.svg'):
-            return True
-        return False
-
-    def __get_hash(self, hex_hash):
-        return hex_to_hash(hex_hash) if ',' not in hex_hash else hex_to_multihash(hex_hash)
-
     def __create_images_hash(self, max_progress: int = 60):
+        self.create_executor()
+
         algorithm_str = settings.value('algorithm', 'rhash', str)
         algorithm = algorithms[algorithm_str]
         use_crop_resistant_hash = settings.value('use_crop_resistant_hash', False, bool)
         hash_size = settings.value('hash_size', 8, int)
 
-        listdir = []
-        if settings.value('check_subdirectories', False, bool):
-            listdir = [os.path.join(root, name) for root, dirs, files in os.walk(self._path) for name in files if self.__is_image(os.path.join(root, name))]
-        else:
-            listdir = [os.path.join(self._path, name) for name in os.listdir(self._path) if self.__is_image(os.path.join(self._path, name))]
-
-        iterations = len(listdir)
-        if iterations > 1:
-            step = round(max_progress / iterations, 2)
-            with ProcessPoolExecutor() as executor:
-                results = [executor.submit(_create_hash, filepath, algorithm, algorithm_str, hash_size, use_crop_resistant_hash) for filepath in listdir]
-                for result in as_completed(results):
-                    processed_image_data = result.result()
-
-                    processed_image = ProcessedImage.create(**processed_image_data)
-                    processed_image.save()
-                    self._processed_images += 1
-                    self._progress += step
-                    self.process_signal.emit(self._progress)
+        iterations = count_files(self._path, settings.value('check_subdirectories', False, bool))
+        files = file_generator(self._path, settings.value('check_subdirectories', False, bool))
+        if iterations > 1 and self.allow_work:
+            step = max_progress / iterations
+            self.results = [self.executor.submit(_create_hash, filepath, algorithm, algorithm_str, hash_size, use_crop_resistant_hash) for filepath in files]
+            for _ in as_completed(self.results):
+                self._processed_images += 1
+                self._progress += step
+                self.process_signal.emit(self._progress)
         else:
             self._progress += max_progress
             self.process_signal.emit(self._progress)
 
-    def __find_duplicates(self, max_progress: int = 20):
-        if self._processed_images:
-            step = round(max_progress / ((self._processed_images - 1) * self._processed_images // 2), 2)
+        self.executor.shutdown()
+
+    def __find_duplicates_old(self, max_progress: int = 20):
+        if self._processed_images and self.allow_work:
+            step = max_progress / ((self._processed_images - 1) * self._processed_images // 2)
             threshold = settings.value('duplicate_threshold', 97.0, float)
             duplicates = {}
 
             for current_image_idx in range(self._processed_images):
                 current_image = ProcessedImage.select().where(ProcessedImage.id == current_image_idx + 1).dicts().get()
-                current_hash = self.__get_hash(current_image['image_hash'])
+                current_hash = _get_hash(current_image['image_hash'])
 
                 for other_image_idx in range(current_image_idx + 1, self._processed_images):
                     other_image = ProcessedImage.select().where(ProcessedImage.id == other_image_idx + 1).dicts().get()
-                    other_hash = self.__get_hash(other_image['image_hash'])
-
+                    other_hash = _get_hash(other_image['image_hash'])
                     difference = current_hash - other_hash
 
                     if (1 - difference) >= round(threshold / 100, 2):
@@ -260,24 +308,50 @@ class FindDuplicatesThread(QtCore.QThread):
 
         return self.__group_duplicates([])
 
-    def __find_full_duplicates(self, max_progress: int = 10):
-        full_duplicates = {}
-        subquery_hash = (ProcessedImage
-                         .select(ProcessedImage.image_hash)
-                         .group_by(ProcessedImage.image_hash)
-                         .having(peewee.fn.COUNT(ProcessedImage.image_hash) > 1))
+    def __find_duplicates(self, max_progress: int = 20):
+        if self._processed_images and self.allow_work:
+            self.create_executor()
 
-        duplicates = list(ProcessedImage.select().where(ProcessedImage.image_hash.in_(subquery_hash)).dicts())
-        if len(duplicates):
-            step = round(max_progress / len(duplicates), 2)
+            step = max_progress / ((self._processed_images - 1) * self._processed_images // 2)
+            threshold = settings.value('duplicate_threshold', 97.0, float)
+            duplicates = []
 
-            for image in duplicates:
-                full_duplicates[image['image_hash']] = full_duplicates.get(image['image_hash'], []) + [image]
-
+            ids = ID_generator(self._processed_images)
+            self.results = [self.executor.submit(_compare_images, id1, id2, threshold) for id1, id2, in ids]
+            for future in as_completed(self.results):
+                result = future.result()
+                if result is not None:
+                    duplicates.append(result)
                 self._progress += step
                 self.process_signal.emit(self._progress)
 
-            return self.__group_duplicates(list(full_duplicates.values()))
+            self.executor.shutdown()
+            return self.__group_duplicates(duplicates)
+
+        self._progress += max_progress
+        self.process_signal.emit(self._progress)
+
+        return self.__group_duplicates([])
+
+    def __find_full_duplicates(self, max_progress: int = 10):
+        if self.allow_work:
+            full_duplicates = {}
+            subquery_hash = (ProcessedImage
+                             .select(ProcessedImage.image_hash)
+                             .group_by(ProcessedImage.image_hash)
+                             .having(peewee.fn.COUNT(ProcessedImage.image_hash) > 1))
+
+            duplicates = list(ProcessedImage.select().where(ProcessedImage.image_hash.in_(subquery_hash)).dicts())
+            if len(duplicates):
+                step = max_progress / len(duplicates)
+
+                for image in duplicates:
+                    full_duplicates[image['image_hash']] = full_duplicates.get(image['image_hash'], []) + [image['id']]
+
+                    self._progress += step
+                    self.process_signal.emit(self._progress)
+
+                return self.__group_duplicates(list(full_duplicates.values()))
 
         self._progress += max_progress
         self.process_signal.emit(self._progress)
@@ -286,19 +360,19 @@ class FindDuplicatesThread(QtCore.QThread):
 
     def __group_duplicates(self, duplicates, max_progress: int = 5):
         if len(duplicates):
-            step = round(max_progress / len(duplicates), 2)
+            step = max_progress / len(duplicates)
             groups = {}
 
-            for duplicate_values in duplicates:
-                duplicate_key = set([image['image_path'] for image in duplicate_values])
+            for duplicate_group in duplicates:
+                duplicate_group_key = set([image_id for image_id in duplicate_group])
                 to_union = []
                 for key in groups.keys():
-                    if not duplicate_key.isdisjoint(set(key)):
+                    if not duplicate_group_key.isdisjoint(set(key)):
                         to_union.append(key)
 
                 if len(to_union):
-                    new_key = duplicate_key
-                    group = duplicate_values
+                    new_key = duplicate_group_key
+                    group = duplicate_group
 
                     for key in to_union:
                         new_key = new_key.union(key)
@@ -310,7 +384,7 @@ class FindDuplicatesThread(QtCore.QThread):
                     groups[tuple(new_key)] = group
 
                 else:
-                    groups[tuple(duplicate_key)] = duplicate_values
+                    groups[tuple(duplicate_group_key)] = duplicate_group
 
                 self._progress += step
                 self.process_signal.emit(self._progress)
@@ -322,11 +396,20 @@ class FindDuplicatesThread(QtCore.QThread):
 
         return []
 
+    def stop(self):
+        for future in self.results:
+            future.cancel()
+
+        self.executor.shutdown(wait=False)
+        self.allow_work = False
+
 
 class PreviewProcessedImage(QtWidgets.QPushButton):
-    def __init__(self, processed_image):
+    def __init__(self, duplicates_list, processed_image_id):
         QtWidgets.QPushButton.__init__(self)
-        self.processed_image = processed_image
+        self.duplicates_list = duplicates_list
+
+        self.processed_image = ProcessedImage.select().where(ProcessedImage.id == processed_image_id).dicts().get()
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
                            QtWidgets.QSizePolicy.Policy.Minimum)
 
@@ -383,10 +466,12 @@ class PreviewProcessedImage(QtWidgets.QPushButton):
         self.pressed.connect(self._select)
 
     def _select(self):
-        self.selected.setChecked(not self.selected.isChecked())
-
-    def isChecked(self):
-        return self.selected.isChecked()
+        if self.processed_image['id'] in self.duplicates_list:
+            self.duplicates_list.remove(self.processed_image['id'])
+            self.selected.setChecked(False)
+        else:
+            self.duplicates_list.append(self.processed_image['id'])
+            self.selected.setChecked(True)
 
 
 class ProcessPage(QtWidgets.QWidget):
@@ -407,7 +492,7 @@ class ProcessPage(QtWidgets.QWidget):
         folder_path_layout.addWidget(folder_path_label, 0, 0)
         folder_path_layout.addWidget(self.folder_path, 1, 0)
         folder_path_layout.addWidget(folder_path_change_button, 1, 1)
-        self.progress = QtWidgets.QProgressBar(value=0, font=text_font)
+        self.progress = QtWidgets.QProgressBar(value=0.0, font=text_font)
 
         self.button_start = QtWidgets.QPushButton('Process', font=text_font)
         self.button_start.clicked.connect(self.start_processing)
@@ -422,6 +507,7 @@ class ProcessPage(QtWidgets.QWidget):
         self.setLayout(layout)
 
         self.duplicates = []
+        self.find_duplicates_thread = None
 
     def select_path(self):
         self.folder_path.setText(QtWidgets.QFileDialog.getExistingDirectory(self, 'Select directory with images'))
@@ -435,6 +521,7 @@ class ProcessPage(QtWidgets.QWidget):
 
     def change_progress(self, value):
         self.progress.setValue(value)
+        self.progress.setFormat(f'{value:.2f} %')
         if value == 100:
             duplicates, full_duplicates = self.find_duplicates_thread.duplicates, self.find_duplicates_thread.full_duplicates
             self.find_duplicates_thread = None
@@ -449,55 +536,94 @@ class ResultPage(QtWidgets.QWidget):
     def __init__(self, folder_path, duplicates) -> None:
         QtWidgets.QWidget.__init__(self)
         self.folder_path = folder_path
-        self.duplicates = []
+        self.duplicates = duplicates
+        self.duplicates_list = []
+        self.previews = []
 
-        preview_layout = QtWidgets.QGridLayout()
-        preview_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        self._page = 0
+        pagination = settings.value('pagination', 'all', str)
+        self._pagination = int(pagination) if pagination != 'all' else len(duplicates)
 
-        scroll_widget = QtWidgets.QWidget()
-        scroll_widget.setLayout(preview_layout)
-        scroll_widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
-                                    QtWidgets.QSizePolicy.Policy.Expanding)
+        self.preview_layout = QtWidgets.QGridLayout()
+        self.preview_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
 
-        scroll = QtWidgets.QScrollArea()
-        scroll.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
-                             QtWidgets.QSizePolicy.Policy.Expanding)
-        scroll.setWidget(scroll_widget)
-        scroll.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
-        scroll.setWidgetResizable(True)
+        self.scroll_widget = QtWidgets.QWidget()
+        self.scroll_widget.setLayout(self.preview_layout)
+        self.scroll_widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                         QtWidgets.QSizePolicy.Policy.Expanding)
 
-        label = QtWidgets.QLabel('Select originals', font=title_font)
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                  QtWidgets.QSizePolicy.Policy.Expanding)
+        self.scroll.setWidget(self.scroll_widget)
+        self.scroll.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        self.scroll.setWidgetResizable(True)
+
+        label = QtWidgets.QLabel('Select dublicates', font=title_font)
         buttons_layout = QtWidgets.QHBoxLayout()
         button_cancel = QtWidgets.QPushButton('Cancel', font=text_font)
         button_cancel.clicked.connect(lambda _: self.signal.emit(True))
         button_continue = QtWidgets.QPushButton('Continue', font=text_font)
-        button_continue.clicked.connect(self._continue)
+        button_continue.clicked.connect(self._process)
         buttons_layout.addWidget(button_cancel)
         buttons_layout.addWidget(button_continue)
+
+        pagination_buttons_layout = QtWidgets.QHBoxLayout()
+        self.button_previous = QtWidgets.QPushButton('Previous', font=text_font)
+        self.button_previous.clicked.connect(self._previous_page)
+        self.button_next = QtWidgets.QPushButton('Next', font=text_font)
+        self.button_next.clicked.connect(self._next_page)
+        pagination_buttons_layout.addWidget(self.button_previous)
+        pagination_buttons_layout.addWidget(self.button_next)
 
         layout = QtWidgets.QGridLayout()
         layout.setRowStretch(1, 1)
         layout.addWidget(label, 0, 0, 1, 4, alignment=QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignHCenter)
-        layout.addWidget(scroll, 1, 0, 9, 4)
+        layout.addWidget(self.scroll, 1, 0, 9, 4)
         layout.addLayout(buttons_layout, 10, 3)
+        layout.addLayout(pagination_buttons_layout, 10, 0)
         self.setLayout(layout)
 
-        for i, duplicate_values in enumerate(duplicates):
-            for j, duplicate in enumerate(duplicate_values):
-                duplicate = PreviewProcessedImage(duplicate)
-                self.duplicates.append(duplicate)
-                preview_layout.addWidget(
-                    duplicate, i, j
-                )
+        self.update_page()
 
-    def _continue(self):
-        duplicate_files = []
-        for duplicate in self.duplicates:
-            if not duplicate.isChecked():
-                duplicate_files.append(duplicate.processed_image['image_path'])
+    @property
+    def max_page(self):
+        if len(self.duplicates):
+            return math.ceil(len(self.duplicates) / self._pagination) - 1
+        return 0
 
-        self.parent()._process_duplicates(self.folder_path, duplicate_files)
+    def _previous_page(self):
+        self._page -= 1
+        self.update_page()
+
+    def _next_page(self):
+        self._page += 1
+        self.update_page()
+
+    def _process(self):
+        self.parent()._process_duplicates(self.folder_path, self.duplicates_list)
         self.signal.emit(True)
+
+    def clear_previews(self):
+        for preview in self.previews:
+            preview.deleteLater()
+        self.previews.clear()
+
+    def update_page(self):
+        self.clear_previews()
+
+        self.button_previous.setDisabled(False)
+        self.button_next.setDisabled(False)
+        if self._page == 0:
+            self.button_previous.setDisabled(True)
+        if self._page == self.max_page:
+            self.button_next.setDisabled(True)
+
+        for i, duplicate_group in enumerate(self.duplicates[self._page * self._pagination: (self._page + 1) * self._pagination]):
+            for j, duplicate_id in enumerate(duplicate_group):
+                preview = PreviewProcessedImage(self.duplicates_list, duplicate_id)
+                self.previews.append(preview)
+                self.preview_layout.addWidget(preview, i, j)
 
 
 class SettingsPage(QtWidgets.QWidget):
@@ -531,6 +657,15 @@ class SettingsPage(QtWidgets.QWidget):
         hash_size_label = QtWidgets.QLabel("Hash size", font=title_font)
         hash_size_layout.addWidget(hash_size_label)
         hash_size_layout.addWidget(self.hash_size)
+
+        max_cores_layout = QtWidgets.QVBoxLayout()
+        max_cores_layout.setSpacing(5)
+        self.max_cores = QtWidgets.QComboBox(font=text_font)
+        self.max_cores.addItems([str(i + 1) for i in range(os.cpu_count() or 1)])
+        self.max_cores.setCurrentText(str(settings.value('max_cores', os.cpu_count() or 1, int)))
+        max_cores_label = QtWidgets.QLabel("Max cores", font=title_font)
+        max_cores_layout.addWidget(max_cores_label)
+        max_cores_layout.addWidget(self.max_cores)
 
         self.check_subdirectories = QtWidgets.QRadioButton(font=text_font, text="Check subdirectories", checked=settings.value('check_subdirectories', False, bool))
 
@@ -598,11 +733,20 @@ class SettingsPage(QtWidgets.QWidget):
 
         image_preview_size_layout = QtWidgets.QVBoxLayout()
         image_preview_size_layout.setSpacing(5)
-        self.image_preview_size = QtWidgets.QSpinBox(minimum=100, maximum=400,value=settings.value('image_preview_size', 150, int), font=text_font)
+        self.image_preview_size = QtWidgets.QSpinBox(minimum=100, maximum=400, value=settings.value('image_preview_size', 150, int), font=text_font)
         image_preview_size_label = QtWidgets.QLabel("Image preview size", font=title_font)
         self.image_preview_size.setSingleStep(10)
         image_preview_size_layout.addWidget(image_preview_size_label)
         image_preview_size_layout.addWidget(self.image_preview_size)
+
+        pagination_layout = QtWidgets.QVBoxLayout()
+        pagination_layout.setSpacing(5)
+        self.pagination = QtWidgets.QComboBox(font=text_font)
+        self.pagination.addItems([str((i + 1) * 10) for i in range(10)] + ['all'])
+        self.pagination.setCurrentText(settings.value('pagination', 'all', str))
+        pagination_label = QtWidgets.QLabel("Pagination", font=title_font)
+        pagination_layout.addWidget(pagination_label)
+        pagination_layout.addWidget(self.pagination)
 
         buttons_layout = QtWidgets.QHBoxLayout()
         button_cancel = QtWidgets.QPushButton('Cancel', font=text_font)
@@ -614,7 +758,8 @@ class SettingsPage(QtWidgets.QWidget):
 
         layout.addLayout(duplicate_folder_name_layout, 0, 0, 2, 2)
         layout.addLayout(duplicate_threshold_layout, 0, 2, 2, 2)
-        layout.addLayout(hash_size_layout, 0, 4, 2, 2)
+        layout.addLayout(hash_size_layout, 0, 4, 2, 1)
+        layout.addLayout(max_cores_layout, 0, 5, 2, 1)
         layout.addWidget(self.check_subdirectories, 2, 0, 1, 2)
         layout.addWidget(self.algorithm, 2, 2, 1, 2)
         layout.addWidget(self.use_crop_resistant_hash, 2, 4, 1, 2)
@@ -623,6 +768,7 @@ class SettingsPage(QtWidgets.QWidget):
         layout.addWidget(sorting_mode_group, 5, 0, 2, 6)
         layout.addWidget(view_settings_group, 7, 0, 3, 3)
         layout.addLayout(image_preview_size_layout, 7, 3, 2, 3)
+        layout.addLayout(pagination_layout, 9, 3, 1, 3)
         layout.addLayout(buttons_layout, 10, 4, 1, 2)
 
         layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
@@ -655,6 +801,7 @@ class SettingsPage(QtWidgets.QWidget):
         settings.setValue('duplicate_folder_name', self.duplicate_folder_name.text())
         settings.setValue('duplicate_threshold', self.duplicate_threshold.value())
         settings.setValue('hash_size', int(self.hash_size.currentText()))
+        settings.setValue('max_cores', int(self.max_cores.currentText()))
         settings.setValue('check_subdirectories', self.check_subdirectories.isChecked())
         settings.setValue('use_crop_resistant_hash', self.use_crop_resistant_hash.isChecked())
         settings.setValue('algorithm', self.algorithm.currentText())
@@ -734,15 +881,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 os.makedirs(path_to_duplicates, exist_ok=True)
 
                 if action_mode == 'semi-auto':
-                    processed_images = move_groups(full_duplicates, path_to_duplicates)
-                    duplicates = update_groups(duplicates, processed_images)
+                    move_groups(full_duplicates, path_to_duplicates)
+                    duplicates = update_groups(duplicates, set([image_id for group in full_duplicates for image_id in group]))
                 elif action_mode == 'auto':
                     move_groups(duplicates, path_to_duplicates)
 
             elif duplicates_action == 'delete':
                 if action_mode == 'semi-auto':
-                    processed_images = remove_groups(full_duplicates)
-                    duplicates = update_groups(duplicates, processed_images)
+                    remove_groups(full_duplicates)
+                    duplicates = update_groups(duplicates, set([image_id for group in full_duplicates for image_id in group]))
 
                 elif action_mode == 'auto':
                     remove_groups(duplicates)
@@ -759,6 +906,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         elif duplicates_action == 'delete':
             remove_files(duplicates)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self._process_page.find_duplicates_thread is not None:
+            self._process_page.find_duplicates_thread.stop()
+        event.accept()
 
 
 if __name__ == '__main__':
