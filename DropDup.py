@@ -812,6 +812,7 @@ class SettingsPage(QtWidgets.QWidget):
         settings.setValue('show_file_size', self.view_settings_show_file_size.isChecked())
         settings.setValue('show_additional_info', self.view_settings_show_additional_info.isChecked())
         settings.setValue('image_preview_size', self.image_preview_size.value())
+        settings.setValue('pagination', self.pagination.currentText())
 
         self.signal.emit(True)
 
